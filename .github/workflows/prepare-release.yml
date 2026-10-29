@@ -1,0 +1,83 @@
+name: Prepare verified update metadata
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing stable release tag, e.g. v1.0.0.5
+        required: true
+        type: string
+permissions:
+  contents: write
+concurrency:
+  group: prepare-update-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+jobs:
+  metadata:
+    if: github.event_name == 'workflow_dispatch' || (github.event.release.draft == false && github.event.release.prerelease == false)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Read trusted publishing tools from main
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Validate tag and fetch signed release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, re, subprocess, pathlib
+          tag = os.environ['RELEASE_TAG']
+          if not re.fullmatch(r'v[0-9]+(?:\.[0-9]+){3}', tag):
+              raise SystemExit('Release tag must be vN.N.N.N')
+          folder = pathlib.Path(os.environ['RUNNER_TEMP']) / 'infinitime-release'
+          folder.mkdir(exist_ok=True)
+          for asset in ('InfiniTime.apk', 'release-notes.json'):
+              subprocess.run(['gh', 'release', 'download', tag, '--pattern', asset,
+                              '--dir', str(folder), '--clobber'], check=True)
+          PY
+      - name: Verify APK and produce exact metadata
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, pathlib, subprocess, json, re
+          sdk = pathlib.Path(os.environ.get('ANDROID_HOME') or os.environ['ANDROID_SDK_ROOT'])
+          candidates = [p for p in (sdk / 'build-tools').iterdir()
+                        if re.fullmatch(r'[0-9]+(?:\.[0-9]+)*', p.name)
+                        and (p / 'aapt2').is_file() and (p / 'apksigner').is_file()]
+          if not candidates:
+              raise SystemExit('Android SDK build-tools missing from runner')
+          tools = max(candidates, key=lambda p: tuple(map(int, p.name.split('.'))))
+          folder = pathlib.Path(os.environ['RUNNER_TEMP']) / 'infinitime-release'
+          apk = folder / 'InfiniTime.apk'
+          if not 0 < apk.stat().st_size <= 150 * 1024 * 1024:
+              raise SystemExit('APK exceeds update-channel size limit')
+          if (folder / 'release-notes.json').stat().st_size > 16384:
+              raise SystemExit('Release notes too large')
+          subprocess.run(['python3', 'tools/create_update_metadata.py', str(apk),
+                          '--notes', str(folder / 'release-notes.json'),
+                          '--aapt', str(tools / 'aapt2'), '--apksigner', str(tools / 'apksigner'),
+                          '--output', str(folder / 'update.json')], check=True)
+          metadata = json.loads((folder / 'update.json').read_text())
+          if metadata['tag'] != os.environ['RELEASE_TAG']:
+              raise SystemExit('APK version and release tag do not match; metadata will not be published')
+          PY
+      - name: Publish metadata alongside the APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release upload "$RELEASE_TAG" "$RUNNER_TEMP/infinitime-release/update.json" --clobber
